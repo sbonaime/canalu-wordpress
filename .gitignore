@@ -1,0 +1,26 @@
+# WordPress
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Nextcloud
+.sync-exclude.lst
+.owncloudsync.log
+.sync*
+
+# Temp files
+*.tmp
+*.log
+*~
+
+# Fichiers de test et développement
+vider-cache.php
+vider-cache-drones.php
+exemple_recherche.html
+BUG-FIX.md
+PROJET-TERMINÉ.md
+prompt.txt

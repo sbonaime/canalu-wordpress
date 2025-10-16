@@ -1,0 +1,548 @@
+/**
+ * Shortcode Canal-U pour WordPress
+ * Usage: [canalu chaine="drones-cap"]
+ * A installer via le plugin Code Snippets (sans la balise php du debut)
+ */
+
+function canalu_shortcode($atts) {
+    $atts = shortcode_atts(array(
+        'chaine' => '',
+        'limite' => 200,
+        'debug' => false,
+    ), $atts);
+
+    $atts['debug'] = filter_var($atts['debug'], FILTER_VALIDATE_BOOLEAN);
+
+    if (empty($atts['chaine'])) {
+        return '<p style="color: red;">Erreur : Veuillez specifier le nom de la chaine avec l\'attribut "chaine"</p>';
+    }
+
+    $chaine_slug = strtolower(trim($atts['chaine']));
+    $transient_key = 'canalu_v2_' . md5($chaine_slug);
+    $result = get_transient($transient_key);
+
+    if ($result === false) {
+        $debug_parse = array('slug_attempts' => array(), 'pages_data' => array());
+
+        // Etape 1 : Recuperer l'ID de la chaine
+        $chaine_id = '';
+        $original_slug = trim($atts['chaine']);
+        $variants = array_unique(array(
+            $original_slug,
+            strtolower($original_slug),
+            str_replace(' ', '-', strtolower($original_slug)),
+            str_replace(' ', '', strtolower($original_slug)),
+        ));
+
+        foreach ($variants as $variant) {
+            $variant = trim($variant);
+            if ($variant === '') continue;
+
+            $chaine_url = 'https://www.canal-u.tv/chaines/' . rawurlencode($variant);
+            $response = wp_remote_get($chaine_url, array(
+                'timeout' => 15,
+                'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ));
+
+            $attempt = array('slug' => $variant);
+
+            if (is_wp_error($response)) {
+                $attempt['error'] = $response->get_error_message();
+                $debug_parse['slug_attempts'][] = $attempt;
+                continue;
+            }
+
+            $html = wp_remote_retrieve_body($response);
+            $attempt['status_code'] = wp_remote_retrieve_response_code($response);
+            $attempt['html_length'] = strlen($html);
+            $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+            if (preg_match('/chaine(?:%3A|:)(\d+)/i', $decoded, $m)) {
+                $chaine_id = $m[1];
+                $attempt['found'] = $chaine_id;
+                $debug_parse['slug_attempts'][] = $attempt;
+                break;
+            }
+
+            if (preg_match('/recherche\?[^"\']*f(?:%5B0%5D|\[0\])=chaine(?:%3A|:)(\d+)/i', $decoded, $m)) {
+                $chaine_id = $m[1];
+                $attempt['found'] = $chaine_id;
+                $debug_parse['slug_attempts'][] = $attempt;
+                break;
+            }
+
+            $debug_parse['slug_attempts'][] = $attempt;
+        }
+
+        if (empty($chaine_id)) {
+            return '<p style="color: red;">Erreur : Impossible de trouver l\'ID de la chaine. Passez <code>debug="true"</code> pour plus de details.</p>';
+        }
+
+        // Etape 2 : Scraper toutes les pages
+        $all_videos = array();
+        $page = 0;
+        $max_pages = 50;
+
+        while ($page < $max_pages && count($all_videos) < $atts['limite']) {
+            $search_url = 'https://www.canal-u.tv/recherche?f%5B0%5D=chaine%3A' . $chaine_id . '&sort_by=field_date_publication_1&page=' . $page;
+
+            $response = wp_remote_get($search_url, array(
+                'timeout' => 15,
+                'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ));
+
+            if (is_wp_error($response)) {
+                $debug_parse['pages_data'][$page] = 'Error: ' . $response->get_error_message();
+                break;
+            }
+
+            $html = wp_remote_retrieve_body($response);
+            $debug_parse['pages_data'][$page] = array(
+                'url' => $search_url,
+                'html_length' => strlen($html),
+                'status_code' => wp_remote_retrieve_response_code($response),
+            );
+
+            // Extraction des blocs video (bloc complet entre deux views-row)
+            $rows = array();
+            if (preg_match_all('/<div[^>]*class="[^"]*views-row[^"]*"[^>]*>(.*?)(?=<div[^>]*class="[^"]*views-row|$)/is', $html, $m_rows, PREG_SET_ORDER)) {
+                foreach ($m_rows as $m) {
+                    $rows[] = $m[1];
+                }
+            }
+
+            $debug_parse['pages_data'][$page]['rows_found'] = count($rows);
+            $debug_parse['pages_data'][$page]['videos_extracted'] = 0;
+            $debug_parse['pages_data'][$page]['rejected_no_link'] = 0;
+            $debug_parse['pages_data'][$page]['rejected_no_title'] = 0;
+            $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] = 0;
+
+            if (empty($rows)) {
+                if ($page === 0) break;
+                break;
+            }
+
+            foreach ($rows as $row) {
+                $article_html = $row;
+
+                // DEBUG: Premier article
+                if ($page === 0 && count($all_videos) === 0 && !isset($debug_parse['first_article'])) {
+                    $debug_parse['first_article'] = substr($article_html, 0, 1500);
+                }
+
+                // Extraire le lien
+                $link = '';
+                if (preg_match('/<a[^>]*href="([^"]*\/chaines\/[^"]+)"[^>]*class="field-group-link"/is', $article_html, $lm)) {
+                    $link = 'https://www.canal-u.tv' . $lm[1];
+                } elseif (preg_match('/<a[^>]*class="field-group-link"[^>]*href="([^"]*\/chaines\/[^"]+)"/is', $article_html, $lm)) {
+                    $link = 'https://www.canal-u.tv' . $lm[1];
+                }
+
+                if (empty($link) || stripos($link, '/user/') !== false) {
+                    $debug_parse['pages_data'][$page]['rejected_no_link'] = isset($debug_parse['pages_data'][$page]['rejected_no_link']) ? $debug_parse['pages_data'][$page]['rejected_no_link'] + 1 : 1;
+                    continue;
+                }
+
+                // Extraire vignette
+                $thumbnail = '';
+                // Chercher d'abord dans wrapper-visuel (structure normale)
+                if (preg_match('/<div[^>]*class="[^"]*wrapper-visuel[^"]*"[^>]*>\s*<img[^>]*src="([^"]+)"/is', $article_html, $tm)) {
+                    $thumbnail = $tm[1];
+                }
+                // Sinon chercher n'importe quelle image dans l'article
+                elseif (preg_match('/<img[^>]*src="([^"]+)"/i', $article_html, $tm)) {
+                    $thumbnail = $tm[1];
+                }
+                // Nettoyer l'URL si elle est relative
+                if (!empty($thumbnail) && !preg_match('/^https?:\/\//', $thumbnail)) {
+                    $thumbnail = 'https://www.canal-u.tv' . $thumbnail;
+                }
+                if (empty($thumbnail)) {
+                    $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] = isset($debug_parse['pages_data'][$page]['rejected_no_thumbnail']) ? $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] + 1 : 1;
+                    $thumbnail = 'https://via.placeholder.com/560x315?text=Canal-U';
+                }
+
+                // Extraire titre
+                $title = '';
+                if (preg_match('/<h3[^>]*>\s*<a[^>]*>(.+?)<\/a>\s*<\/h3>/is', $article_html, $titlem)) {
+                    $title = html_entity_decode(strip_tags($titlem[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    $title = trim($title);
+                }
+
+                if (empty($title)) {
+                    $debug_parse['pages_data'][$page]['rejected_no_title'] = isset($debug_parse['pages_data'][$page]['rejected_no_title']) ? $debug_parse['pages_data'][$page]['rejected_no_title'] + 1 : 1;
+                    continue;
+                }
+
+                // Extraire auteurs
+                $auteurs = '';
+                if (preg_match('/<div[^>]*class="wrapper-intervenants"[^>]*>(.*?)<\/div>/is', $article_html, $im)) {
+                    if (preg_match_all('/<p[^>]*class="wrapper-intervenant"[^>]*>([^<]+)<\/p>/i', $im[1], $ams)) {
+                        $auteurs = implode(', ', array_map('trim', $ams[1]));
+                    }
+                }
+
+                // Extraire description
+                $description = '';
+                if (preg_match('/<div[^>]*class="[^"]*field--name-field-chapeau[^"]*"[^>]*>\s*<p>(.+?)<\/p>/is', $article_html, $dm)) {
+                    $description = trim(strip_tags($dm[1]));
+                    if (strlen($description) > 250) {
+                        $description = substr($description, 0, 250) . '...';
+                    }
+                }
+
+                // Extraire type
+                $type = '';
+                if (preg_match('/<div[^>]*class="[^"]*field--name-field-type-production[^"]*"[^>]*>.*?<div[^>]*class="[^"]*field__item[^"]*"[^>]*>([^<]+)<\/div>/is', $article_html, $tym)) {
+                    $type = trim($tym[1]);
+                }
+
+                // Extraire duree
+                $duree = '';
+                if (preg_match('/<div[^>]*class="[^"]*wrapper-time[^"]*"[^>]*>([^<]+)<\/div>/i', $article_html, $durm)) {
+                    $duree = trim($durm[1]);
+                }
+
+                // Extraire date
+                $date = '';
+                if (preg_match('/<time[^>]*class="datetime"[^>]*>([^<]+)<\/time>/i', $article_html, $datm)) {
+                    $date = trim($datm[1]);
+                }
+
+                // Extraire niveau
+                $niveau = 0;
+                if (preg_match('/<li[^>]*aria-label="[^"]*Niveau[^"]*"[^>]*>(.*?)<\/li>/is', $article_html, $nivm)) {
+                    preg_match_all('/<span[^>]*class="niveau active"/i', $nivm[1], $nivc);
+                    $niveau = count($nivc[0]);
+                }
+
+                // Extraire documents
+                $documents = 0;
+                if (preg_match('/<li[^>]*aria-label="[^"]*Documentation[^"]*"[^>]*>(.*?)<\/li>/is', $article_html, $docm)) {
+                    preg_match_all('/<span[^>]*class="document active"/i', $docm[1], $docc);
+                    $documents = count($docc[0]);
+                }
+
+                $all_videos[] = array(
+                    'title' => $title,
+                    'link' => $link,
+                    'thumbnail' => $thumbnail,
+                    'auteurs' => $auteurs,
+                    'description' => $description,
+                    'type' => $type,
+                    'duree' => $duree,
+                    'date' => $date,
+                    'niveau' => $niveau,
+                    'documents' => $documents,
+                );
+
+                $debug_parse['pages_data'][$page]['videos_extracted']++;
+
+                if (count($all_videos) >= $atts['limite']) {
+                    break 2;
+                }
+            }
+
+            $page++;
+        }
+
+        $result = array(
+            'chaine_id' => $chaine_id,
+            'videos' => $all_videos,
+            'pages_scraped' => $page,
+            'debug_parse' => $debug_parse,
+        );
+
+        if (!empty($all_videos)) {
+            set_transient($transient_key, $result, HOUR_IN_SECONDS);
+        }
+    }
+
+    $videos = $result['videos'];
+
+    if (empty($videos)) {
+        $debug_info = '<p>Aucune video trouvee pour la chaine "' . esc_html($atts['chaine']) . '".</p>';
+        if (!empty($result['chaine_id'])) {
+            $debug_info .= '<p style="color: #666; font-size: 14px;">ID de chaine trouve : ' . esc_html($result['chaine_id']) . '</p>';
+            $debug_info .= '<p style="color: #666; font-size: 14px;">Pages scrapees : ' . esc_html($result['pages_scraped']) . '</p>';
+        }
+        
+        if ($atts['debug']) {
+            $debug_info .= '<div style="background: #f0f0f0; border: 2px solid #cc0000; padding: 20px; margin: 20px 0; font-family: monospace; font-size: 12px;">';
+            $debug_info .= '<h4 style="margin-top: 0; color: #cc0000;">Debug Complet</h4>';
+            if (!empty($result['debug_parse'])) {
+                $debug_info .= '<pre style="background: white; padding: 10px; overflow: auto; font-size: 10px; max-height: 500px;">' . esc_html(print_r($result['debug_parse'], true)) . '</pre>';
+            }
+            $debug_info .= '</div>';
+        } else {
+            $debug_info .= '<p style="color: #0066cc;">Ajoutez <code>debug="true"</code> pour plus de details</p>';
+        }
+        
+        return $debug_info;
+    }
+
+    ob_start();
+
+    if ($atts['debug']) {
+        echo '<div style="background: #f0f0f0; border: 2px solid #0066cc; padding: 20px; margin: 20px 0; font-family: monospace; font-size: 12px;">';
+        echo '<h4 style="margin-top: 0; color: #0066cc;">Debug Info</h4>';
+        echo '<p><strong>ID Chaine:</strong> ' . esc_html($result['chaine_id']) . '</p>';
+        echo '<p><strong>Pages scrapees:</strong> ' . esc_html($result['pages_scraped']) . '</p>';
+        echo '<p><strong>Videos trouvees:</strong> ' . count($videos) . '</p>';
+        if (!empty($videos[0])) {
+            echo '<p><strong>Premiere video:</strong> ' . esc_html($videos[0]['title']) . '</p>';
+        }
+        
+        // Afficher le détail par page
+        if (!empty($result['debug_parse']['pages_data'])) {
+            echo '<h5 style="margin: 15px 0 10px; color: #0066cc;">Détail par page:</h5>';
+            echo '<table style="width: 100%; border-collapse: collapse; background: white;">';
+            echo '<tr style="background: #0066cc; color: white;">';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Page</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Blocs trouvés</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Vidéos extraites</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de lien)</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de titre)</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de vignette)</th>';
+            echo '</tr>';
+            
+            foreach ($result['debug_parse']['pages_data'] as $page_num => $page_data) {
+                if (is_array($page_data)) {
+                    echo '<tr>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . esc_html($page_num) . '</td>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . (isset($page_data['rows_found']) ? esc_html($page_data['rows_found']) : '0') . '</td>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #d4edda;">' . (isset($page_data['videos_extracted']) ? esc_html($page_data['videos_extracted']) : '0') . '</td>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #f8d7da;">' . (isset($page_data['rejected_no_link']) ? esc_html($page_data['rejected_no_link']) : '0') . '</td>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #fff3cd;">' . (isset($page_data['rejected_no_title']) ? esc_html($page_data['rejected_no_title']) : '0') . '</td>';
+                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #ffeaa7;">' . (isset($page_data['rejected_no_thumbnail']) ? esc_html($page_data['rejected_no_thumbnail']) : '0') . '</td>';
+                    echo '</tr>';
+                }
+            }
+            echo '</table>';
+        }
+        
+        echo '</div>';
+    }
+    ?>
+
+    <style>
+        .canalu-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+            margin: 20px 0;
+            padding: 0;
+        }
+        @media (min-width: 600px) {
+            .canalu-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (min-width: 900px) {
+            .canalu-grid { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (min-width: 1200px) {
+            .canalu-grid { grid-template-columns: repeat(4, 1fr); }
+        }
+        .canalu-video-card {
+            background: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            overflow: hidden;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+        .canalu-video-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .canalu-thumbnail-wrapper {
+            position: relative;
+            width: 100%;
+            padding-bottom: 56.25%;
+            overflow: hidden;
+            background: #000;
+        }
+        .canalu-thumbnail {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .canalu-badge-type {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 102, 204, 0.9);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .canalu-badge-duree {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .canalu-content {
+            padding: 15px;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .canalu-title {
+            margin: 0 0 8px 0;
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+        .canalu-title a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+        .canalu-title a:hover {
+            text-decoration: underline;
+        }
+        .canalu-auteurs {
+            color: #666;
+            font-size: 13px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            line-height: 1.3;
+        }
+        .canalu-description {
+            color: #888;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-bottom: 10px;
+            flex-grow: 1;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .canalu-meta-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-top: 10px;
+            border-top: 1px solid #e0e0e0;
+            margin-top: auto;
+            font-size: 12px;
+            color: #999;
+        }
+        .canalu-date {
+            font-weight: 500;
+        }
+        .canalu-qualites {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+        .canalu-niveau, .canalu-documents {
+            display: flex;
+            gap: 2px;
+            align-items: center;
+        }
+        .canalu-niveau span, .canalu-documents span {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ddd;
+        }
+        .canalu-niveau span.active {
+            background: #0066cc;
+        }
+        .canalu-documents span.active {
+            background: #28a745;
+        }
+        .canalu-header {
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #0066cc;
+        }
+        .canalu-header h3 {
+            margin: 0;
+            color: #333;
+            font-size: 24px;
+        }
+        .canalu-count {
+            color: #666;
+            font-size: 14px;
+            margin-top: 5px;
+        }
+    </style>
+
+    <div class="canalu-wrapper">
+        <div class="canalu-header">
+            <h3>Chaine <?php echo esc_html(ucwords(str_replace('-', ' ', $atts['chaine']))); ?></h3>
+            <div class="canalu-count"><?php echo count($videos); ?> video<?php echo count($videos) > 1 ? 's' : ''; ?></div>
+        </div>
+
+        <div class="canalu-grid">
+            <?php foreach ($videos as $video): ?>
+                <article class="canalu-video-card">
+                    <a href="<?php echo esc_url($video['link']); ?>" target="_blank" rel="noopener">
+                        <div class="canalu-thumbnail-wrapper">
+                            <img src="<?php echo esc_url($video['thumbnail']); ?>" alt="<?php echo esc_attr($video['title']); ?>" class="canalu-thumbnail" loading="lazy">
+                            <?php if (!empty($video['type'])): ?>
+                                <div class="canalu-badge-type"><?php echo esc_html($video['type']); ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($video['duree'])): ?>
+                                <div class="canalu-badge-duree"><?php echo esc_html($video['duree']); ?></div>
+                            <?php endif; ?>
+                        </div>
+                    </a>
+                    <div class="canalu-content">
+                        <h4 class="canalu-title">
+                            <a href="<?php echo esc_url($video['link']); ?>" target="_blank" rel="noopener">
+                                <?php echo esc_html($video['title']); ?>
+                            </a>
+                        </h4>
+                        <?php if (!empty($video['auteurs'])): ?>
+                            <div class="canalu-auteurs"><?php echo esc_html($video['auteurs']); ?></div>
+                        <?php endif; ?>
+                        <?php if (!empty($video['description'])): ?>
+                            <div class="canalu-description"><?php echo esc_html($video['description']); ?></div>
+                        <?php endif; ?>
+                        <div class="canalu-meta-footer">
+                            <div class="canalu-date"><?php echo !empty($video['date']) ? esc_html($video['date']) : ''; ?></div>
+                            <div class="canalu-qualites">
+                                <?php if (!empty($video['documents'])): ?>
+                                    <div class="canalu-documents" title="<?php echo $video['documents']; ?> document(s)">
+                                        <?php for ($i = 1; $i <= 3; $i++): ?>
+                                            <span<?php echo $i <= $video['documents'] ? ' class="active"' : ''; ?>></span>
+                                        <?php endfor; ?>
+                                    </div>
+                                <?php endif; ?>
+                                <?php if (!empty($video['niveau'])): ?>
+                                    <div class="canalu-niveau" title="Niveau: <?php echo $video['niveau']; ?>/3">
+                                        <?php for ($i = 1; $i <= 3; $i++): ?>
+                                            <span<?php echo $i <= $video['niveau'] ? ' class="active"' : ''; ?>></span>
+                                        <?php endfor; ?>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    </div>
+                </article>
+            <?php endforeach; ?>
+        </div>
+    </div>
+
+    <?php
+    return ob_get_clean();
+}
+
+add_shortcode('canalu', 'canalu_shortcode');
