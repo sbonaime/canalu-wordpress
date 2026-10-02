@@ -2,49 +2,144 @@
  * Shortcode Canal-U pour WordPress
  * Usage: [canalu chaine="drones-cap"]
  * A installer via le plugin Code Snippets (sans la balise php du debut)
+ * Recupere l'integralite des videos via le flux RSS de la chaine (pas de pagination a gerer)
  */
+
+// Garde une trace de chaque tentative de recuperation de vignette pour le panneau debug
+function canalu_thumbnail_debug_log($entry = null) {
+    static $log = array();
+    if ($entry !== null) {
+        $log[] = $entry;
+    }
+    return $log;
+}
+
+// canal-u.tv bloque (HTTP 403 + page "bot_challenge") l'IP du serveur des qu'elle enchaine plusieurs pages video d'affilee.
+// Reessayer ne sert a rien (le blocage n'est pas aleatoire par requete) : on detecte le 403 et on coupe immediatement
+// toutes les tentatives suivantes pour ce chargement, pour ne pas prolonger/aggraver le blocage. Nouvel essai ~15 min plus tard.
+function canalu_antibot_blocked() {
+    return get_transient('canalu_antibot_block') !== false;
+}
+
+function canalu_mark_antibot_blocked() {
+    set_transient('canalu_antibot_block', true, 15 * MINUTE_IN_SECONDS);
+}
+
+// Le flux RSS n'a pas de vignette par video : on va la chercher sur la page de la video (balise og:image), avec un cache dedie
+// Seule une vignette trouvee avec succes est mise en cache longtemps ; un echec n'est garde que quelques minutes pour pouvoir reessayer
+// $budget limite le nombre de vraies requetes HTTP par chargement de page : canal-u.tv bloque/ralentit si on enchaine trop de requetes d'un coup,
+// le reste des vignettes se remplira progressivement au fil des prochains chargements (chaque succes est cache 1 semaine, donc jamais redemande)
+function canalu_fetch_video_thumbnail($link, $fallback, &$budget) {
+    $thumb_key = 'canalu_thumb_v2_' . md5($link);
+    $cached = get_transient($thumb_key);
+
+    if ($cached !== false) {
+        canalu_thumbnail_debug_log(array('link' => $link, 'source' => 'cache', 'found' => !empty($cached)));
+        return !empty($cached) ? $cached : $fallback;
+    }
+
+    if ($budget <= 0) {
+        canalu_thumbnail_debug_log(array('link' => $link, 'found' => false, 'error' => 'budget de requetes epuise pour ce chargement'));
+        return $fallback;
+    }
+
+    if (canalu_antibot_blocked()) {
+        $budget = 0;
+        canalu_thumbnail_debug_log(array('link' => $link, 'found' => false, 'error' => 'anti-bot canal-u.tv actif, nouvel essai dans ~15 min'));
+        return $fallback;
+    }
+    $budget--;
+
+    $response = wp_remote_get($link, array(
+        'timeout' => 10,
+        'redirection' => 5,
+        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    ));
+
+    if (is_wp_error($response)) {
+        set_transient($thumb_key, '', 10 * MINUTE_IN_SECONDS);
+        canalu_thumbnail_debug_log(array('link' => $link, 'found' => false, 'error' => $response->get_error_message()));
+        return $fallback;
+    }
+
+    $status_code = wp_remote_retrieve_response_code($response);
+    if ($status_code !== 200) {
+        if ($status_code === 403) {
+            canalu_mark_antibot_blocked();
+            $budget = 0;
+        }
+        set_transient($thumb_key, '', 10 * MINUTE_IN_SECONDS);
+        canalu_thumbnail_debug_log(array('link' => $link, 'found' => false, 'status_code' => $status_code));
+        return $fallback;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    if (preg_match('/<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']/i', $body, $m)
+        || preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']/i', $body, $m)) {
+        $thumbnail = html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        set_transient($thumb_key, $thumbnail, WEEK_IN_SECONDS);
+        canalu_thumbnail_debug_log(array('link' => $link, 'found' => true, 'status_code' => $status_code));
+        return $thumbnail;
+    }
+
+    set_transient($thumb_key, '', 10 * MINUTE_IN_SECONDS);
+    canalu_thumbnail_debug_log(array('link' => $link, 'found' => false, 'status_code' => $status_code, 'body_length' => strlen($body)));
+    return $fallback;
+}
+
 
 function canalu_shortcode($atts) {
     $atts = shortcode_atts(array(
         'chaine' => '',
         'limite' => 200,
         'debug' => false,
+        'clear' => false,
     ), $atts);
 
     $atts['debug'] = filter_var($atts['debug'], FILTER_VALIDATE_BOOLEAN);
+    $atts['clear'] = filter_var($atts['clear'], FILTER_VALIDATE_BOOLEAN);
 
     if (empty($atts['chaine'])) {
         return '<p style="color: red;">Erreur : Veuillez specifier le nom de la chaine avec l\'attribut "chaine"</p>';
     }
 
     $chaine_slug = strtolower(trim($atts['chaine']));
-    $transient_key = 'canalu_v2_' . md5($chaine_slug);
+    $transient_key = 'canalu_rss_v3_' . md5($chaine_slug);
+
+    // L'attribut clear="true" permet de forcer un rafraichissement complet sans toucher au code (a retirer une fois le test fait)
+    if ($atts['clear']) {
+        delete_transient($transient_key);
+    }
+
     $result = get_transient($transient_key);
 
     if ($result === false) {
-        $debug_parse = array('slug_attempts' => array(), 'pages_data' => array());
+        $debug_parse = array('slug_attempts' => array());
 
-        // Etape 1 : Recuperer l'ID de la chaine
-        $chaine_id = '';
+        // Essaye plusieurs variantes du slug pour trouver le bon flux RSS de la chaine
         $original_slug = trim($atts['chaine']);
         $variants = array_unique(array(
             $original_slug,
             strtolower($original_slug),
             str_replace(' ', '-', strtolower($original_slug)),
-            str_replace(' ', '', strtolower($original_slug)),
+            str_replace('-', ' ', strtolower($original_slug)),
         ));
+
+        $xml = null;
+        $chaine_titre = '';
+        $chaine_image = '';
 
         foreach ($variants as $variant) {
             $variant = trim($variant);
             if ($variant === '') continue;
 
-            $chaine_url = 'https://www.canal-u.tv/chaines/' . rawurlencode($variant);
-            $response = wp_remote_get($chaine_url, array(
-                'timeout' => 15,
+            $rss_url = 'https://www.canal-u.tv/chaines/' . rawurlencode($variant) . '/rss';
+            $response = wp_remote_get($rss_url, array(
+                'timeout' => 20,
                 'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             ));
 
-            $attempt = array('slug' => $variant);
+            $attempt = array('slug' => $variant, 'url' => $rss_url);
 
             if (is_wp_error($response)) {
                 $attempt['error'] = $response->get_error_message();
@@ -52,204 +147,106 @@ function canalu_shortcode($atts) {
                 continue;
             }
 
-            $html = wp_remote_retrieve_body($response);
             $attempt['status_code'] = wp_remote_retrieve_response_code($response);
-            $attempt['html_length'] = strlen($html);
-            $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $body = wp_remote_retrieve_body($response);
+            $attempt['body_length'] = strlen($body);
 
-            if (preg_match('/chaine(?:%3A|:)(\d+)/i', $decoded, $m)) {
-                $chaine_id = $m[1];
-                $attempt['found'] = $chaine_id;
+            if ($attempt['status_code'] !== 200 || empty($body)) {
                 $debug_parse['slug_attempts'][] = $attempt;
-                break;
+                continue;
             }
 
-            if (preg_match('/recherche\?[^"\']*f(?:%5B0%5D|\[0\])=chaine(?:%3A|:)(\d+)/i', $decoded, $m)) {
-                $chaine_id = $m[1];
-                $attempt['found'] = $chaine_id;
+            libxml_use_internal_errors(true);
+            $parsed = simplexml_load_string($body);
+            libxml_use_internal_errors(false);
+
+            if ($parsed === false || empty($parsed->channel->item)) {
+                $attempt['error'] = 'Flux RSS invalide ou sans video';
                 $debug_parse['slug_attempts'][] = $attempt;
-                break;
+                continue;
             }
 
+            $attempt['items_found'] = count($parsed->channel->item);
             $debug_parse['slug_attempts'][] = $attempt;
+
+            $xml = $parsed;
+            $chaine_titre = trim((string) $parsed->channel->title);
+            $chaine_image = isset($parsed->channel->image->url) ? trim((string) $parsed->channel->image->url) : '';
+            break;
         }
 
-        if (empty($chaine_id)) {
-            return '<p style="color: red;">Erreur : Impossible de trouver l\'ID de la chaine. Passez <code>debug="true"</code> pour plus de details.</p>';
+        if ($xml === null) {
+            $error_html = '<p style="color: red;">Erreur : Impossible de recuperer le flux RSS de la chaine.</p>';
+            if ($atts['debug']) {
+                $error_html .= '<div style="background: #f0f0f0; border: 2px solid #cc0000; padding: 20px; margin: 20px 0; font-family: monospace; font-size: 12px;">';
+                $error_html .= '<h4 style="margin-top: 0; color: #cc0000;">Debug : tentatives de flux RSS</h4>';
+                $error_html .= '<pre style="background: white; padding: 10px; overflow: auto; font-size: 11px; max-height: 500px;">' . esc_html(print_r($debug_parse, true)) . '</pre>';
+                $error_html .= '</div>';
+            } else {
+                $error_html .= '<p style="color: #0066cc;">Ajoutez <code>debug="true"</code> pour plus de details</p>';
+            }
+            return $error_html;
         }
 
-        // Etape 2 : Scraper toutes les pages
+        // Le flux RSS contient directement toutes les videos de la chaine, sans pagination
         $all_videos = array();
-        $page = 0;
-        $max_pages = 50;
+        $fallback_thumbnail = !empty($chaine_image) ? $chaine_image : 'https://via.placeholder.com/560x315?text=Canal-U';
+        $limite = (int) $atts['limite'];
+        if ($limite <= 0) {
+            $limite = 200;
+        }
+        // Max 8 vraies requetes vignettes par chargement de page pour eviter de declencher un blocage anti-scraping chez canal-u.tv
+        $thumb_fetch_budget = 8;
 
-        while ($page < $max_pages && count($all_videos) < $atts['limite']) {
-            $search_url = 'https://www.canal-u.tv/recherche?f%5B0%5D=chaine%3A' . $chaine_id . '&sort_by=field_date_publication_1&page=' . $page;
-
-            $response = wp_remote_get($search_url, array(
-                'timeout' => 15,
-                'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            ));
-
-            if (is_wp_error($response)) {
-                $debug_parse['pages_data'][$page] = 'Error: ' . $response->get_error_message();
+        foreach ($xml->channel->item as $item) {
+            if (count($all_videos) >= $limite) {
                 break;
             }
 
-            $html = wp_remote_retrieve_body($response);
-            $debug_parse['pages_data'][$page] = array(
-                'url' => $search_url,
-                'html_length' => strlen($html),
-                'status_code' => wp_remote_retrieve_response_code($response),
+            $title = trim((string) $item->title);
+            $link = trim((string) $item->link);
+
+            if (empty($title) || empty($link)) {
+                continue;
+            }
+
+            $description = trim((string) $item->description);
+            if (strlen($description) > 250) {
+                $description = substr($description, 0, 250) . '...';
+            }
+
+            $date = '';
+            $timestamp = strtotime((string) $item->pubDate);
+            if ($timestamp) {
+                $date = date_i18n('d/m/Y', $timestamp);
+            }
+
+            // L'attribut "length" de l'enclosure correspond a la duree de la video en secondes
+            $duree = '';
+            if (isset($item->enclosure)) {
+                $seconds = (int) $item->enclosure->attributes()->length;
+                if ($seconds > 0) {
+                    $duree = sprintf('%d:%02d', floor($seconds / 60), $seconds % 60);
+                }
+            }
+
+            $all_videos[] = array(
+                'title' => $title,
+                'link' => $link,
+                'thumbnail' => canalu_fetch_video_thumbnail($link, $fallback_thumbnail, $thumb_fetch_budget),
+                'auteurs' => '',
+                'description' => $description,
+                'type' => '',
+                'duree' => $duree,
+                'date' => $date,
+                'niveau' => 0,
+                'documents' => 0,
             );
-
-            // Extraction des blocs video (bloc complet entre deux views-row)
-            $rows = array();
-            if (preg_match_all('/<div[^>]*class="[^"]*views-row[^"]*"[^>]*>(.*?)(?=<div[^>]*class="[^"]*views-row|$)/is', $html, $m_rows, PREG_SET_ORDER)) {
-                foreach ($m_rows as $m) {
-                    $rows[] = $m[1];
-                }
-            }
-
-            $debug_parse['pages_data'][$page]['rows_found'] = count($rows);
-            $debug_parse['pages_data'][$page]['videos_extracted'] = 0;
-            $debug_parse['pages_data'][$page]['rejected_no_link'] = 0;
-            $debug_parse['pages_data'][$page]['rejected_no_title'] = 0;
-            $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] = 0;
-
-            if (empty($rows)) {
-                if ($page === 0) break;
-                break;
-            }
-
-            foreach ($rows as $row) {
-                $article_html = $row;
-
-                // DEBUG: Premier article
-                if ($page === 0 && count($all_videos) === 0 && !isset($debug_parse['first_article'])) {
-                    $debug_parse['first_article'] = substr($article_html, 0, 1500);
-                }
-
-                // Extraire le lien
-                $link = '';
-                if (preg_match('/<a[^>]*href="([^"]*\/chaines\/[^"]+)"[^>]*class="field-group-link"/is', $article_html, $lm)) {
-                    $link = 'https://www.canal-u.tv' . $lm[1];
-                } elseif (preg_match('/<a[^>]*class="field-group-link"[^>]*href="([^"]*\/chaines\/[^"]+)"/is', $article_html, $lm)) {
-                    $link = 'https://www.canal-u.tv' . $lm[1];
-                }
-
-                if (empty($link) || stripos($link, '/user/') !== false) {
-                    $debug_parse['pages_data'][$page]['rejected_no_link'] = isset($debug_parse['pages_data'][$page]['rejected_no_link']) ? $debug_parse['pages_data'][$page]['rejected_no_link'] + 1 : 1;
-                    continue;
-                }
-
-                // Extraire vignette
-                $thumbnail = '';
-                // Chercher d'abord dans wrapper-visuel (structure normale)
-                if (preg_match('/<div[^>]*class="[^"]*wrapper-visuel[^"]*"[^>]*>\s*<img[^>]*src="([^"]+)"/is', $article_html, $tm)) {
-                    $thumbnail = $tm[1];
-                }
-                // Sinon chercher n'importe quelle image dans l'article
-                elseif (preg_match('/<img[^>]*src="([^"]+)"/i', $article_html, $tm)) {
-                    $thumbnail = $tm[1];
-                }
-                // Nettoyer l'URL si elle est relative
-                if (!empty($thumbnail) && !preg_match('/^https?:\/\//', $thumbnail)) {
-                    $thumbnail = 'https://www.canal-u.tv' . $thumbnail;
-                }
-                if (empty($thumbnail)) {
-                    $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] = isset($debug_parse['pages_data'][$page]['rejected_no_thumbnail']) ? $debug_parse['pages_data'][$page]['rejected_no_thumbnail'] + 1 : 1;
-                    $thumbnail = 'https://via.placeholder.com/560x315?text=Canal-U';
-                }
-
-                // Extraire titre
-                $title = '';
-                if (preg_match('/<h3[^>]*>\s*<a[^>]*>(.+?)<\/a>\s*<\/h3>/is', $article_html, $titlem)) {
-                    $title = html_entity_decode(strip_tags($titlem[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                    $title = trim($title);
-                }
-
-                if (empty($title)) {
-                    $debug_parse['pages_data'][$page]['rejected_no_title'] = isset($debug_parse['pages_data'][$page]['rejected_no_title']) ? $debug_parse['pages_data'][$page]['rejected_no_title'] + 1 : 1;
-                    continue;
-                }
-
-                // Extraire auteurs
-                $auteurs = '';
-                if (preg_match('/<div[^>]*class="wrapper-intervenants"[^>]*>(.*?)<\/div>/is', $article_html, $im)) {
-                    if (preg_match_all('/<p[^>]*class="wrapper-intervenant"[^>]*>([^<]+)<\/p>/i', $im[1], $ams)) {
-                        $auteurs = implode(', ', array_map('trim', $ams[1]));
-                    }
-                }
-
-                // Extraire description
-                $description = '';
-                if (preg_match('/<div[^>]*class="[^"]*field--name-field-chapeau[^"]*"[^>]*>\s*<p>(.+?)<\/p>/is', $article_html, $dm)) {
-                    $description = trim(strip_tags($dm[1]));
-                    if (strlen($description) > 250) {
-                        $description = substr($description, 0, 250) . '...';
-                    }
-                }
-
-                // Extraire type
-                $type = '';
-                if (preg_match('/<div[^>]*class="[^"]*field--name-field-type-production[^"]*"[^>]*>.*?<div[^>]*class="[^"]*field__item[^"]*"[^>]*>([^<]+)<\/div>/is', $article_html, $tym)) {
-                    $type = trim($tym[1]);
-                }
-
-                // Extraire duree
-                $duree = '';
-                if (preg_match('/<div[^>]*class="[^"]*wrapper-time[^"]*"[^>]*>([^<]+)<\/div>/i', $article_html, $durm)) {
-                    $duree = trim($durm[1]);
-                }
-
-                // Extraire date
-                $date = '';
-                if (preg_match('/<time[^>]*class="datetime"[^>]*>([^<]+)<\/time>/i', $article_html, $datm)) {
-                    $date = trim($datm[1]);
-                }
-
-                // Extraire niveau
-                $niveau = 0;
-                if (preg_match('/<li[^>]*aria-label="[^"]*Niveau[^"]*"[^>]*>(.*?)<\/li>/is', $article_html, $nivm)) {
-                    preg_match_all('/<span[^>]*class="niveau active"/i', $nivm[1], $nivc);
-                    $niveau = count($nivc[0]);
-                }
-
-                // Extraire documents
-                $documents = 0;
-                if (preg_match('/<li[^>]*aria-label="[^"]*Documentation[^"]*"[^>]*>(.*?)<\/li>/is', $article_html, $docm)) {
-                    preg_match_all('/<span[^>]*class="document active"/i', $docm[1], $docc);
-                    $documents = count($docc[0]);
-                }
-
-                $all_videos[] = array(
-                    'title' => $title,
-                    'link' => $link,
-                    'thumbnail' => $thumbnail,
-                    'auteurs' => $auteurs,
-                    'description' => $description,
-                    'type' => $type,
-                    'duree' => $duree,
-                    'date' => $date,
-                    'niveau' => $niveau,
-                    'documents' => $documents,
-                );
-
-                $debug_parse['pages_data'][$page]['videos_extracted']++;
-
-                if (count($all_videos) >= $atts['limite']) {
-                    break 2;
-                }
-            }
-
-            $page++;
         }
 
         $result = array(
-            'chaine_id' => $chaine_id,
+            'chaine_id' => $chaine_titre,
             'videos' => $all_videos,
-            'pages_scraped' => $page,
             'debug_parse' => $debug_parse,
         );
 
@@ -263,10 +260,9 @@ function canalu_shortcode($atts) {
     if (empty($videos)) {
         $debug_info = '<p>Aucune video trouvee pour la chaine "' . esc_html($atts['chaine']) . '".</p>';
         if (!empty($result['chaine_id'])) {
-            $debug_info .= '<p style="color: #666; font-size: 14px;">ID de chaine trouve : ' . esc_html($result['chaine_id']) . '</p>';
-            $debug_info .= '<p style="color: #666; font-size: 14px;">Pages scrapees : ' . esc_html($result['pages_scraped']) . '</p>';
+            $debug_info .= '<p style="color: #666; font-size: 14px;">Chaine trouvee : ' . esc_html($result['chaine_id']) . '</p>';
         }
-        
+
         if ($atts['debug']) {
             $debug_info .= '<div style="background: #f0f0f0; border: 2px solid #cc0000; padding: 20px; margin: 20px 0; font-family: monospace; font-size: 12px;">';
             $debug_info .= '<h4 style="margin-top: 0; color: #cc0000;">Debug Complet</h4>';
@@ -277,7 +273,7 @@ function canalu_shortcode($atts) {
         } else {
             $debug_info .= '<p style="color: #0066cc;">Ajoutez <code>debug="true"</code> pour plus de details</p>';
         }
-        
+
         return $debug_info;
     }
 
@@ -286,41 +282,63 @@ function canalu_shortcode($atts) {
     if ($atts['debug']) {
         echo '<div style="background: #f0f0f0; border: 2px solid #0066cc; padding: 20px; margin: 20px 0; font-family: monospace; font-size: 12px;">';
         echo '<h4 style="margin-top: 0; color: #0066cc;">Debug Info</h4>';
-        echo '<p><strong>ID Chaine:</strong> ' . esc_html($result['chaine_id']) . '</p>';
-        echo '<p><strong>Pages scrapees:</strong> ' . esc_html($result['pages_scraped']) . '</p>';
-        echo '<p><strong>Videos trouvees:</strong> ' . count($videos) . '</p>';
+        echo '<p><strong>Chaine:</strong> ' . esc_html($result['chaine_id']) . '</p>';
+        echo '<p><strong>Videos trouvees dans le flux RSS:</strong> ' . count($result['videos']) . '</p>';
+        echo '<p><strong>Videos affichees:</strong> ' . count($videos) . '</p>';
         if (!empty($videos[0])) {
             echo '<p><strong>Premiere video:</strong> ' . esc_html($videos[0]['title']) . '</p>';
         }
-        
-        // Afficher le détail par page
-        if (!empty($result['debug_parse']['pages_data'])) {
-            echo '<h5 style="margin: 15px 0 10px; color: #0066cc;">Détail par page:</h5>';
+
+        // Afficher le detail des tentatives de flux RSS
+        if (!empty($result['debug_parse']['slug_attempts'])) {
+            echo '<h5 style="margin: 15px 0 10px; color: #0066cc;">Tentatives de flux RSS:</h5>';
             echo '<table style="width: 100%; border-collapse: collapse; background: white;">';
             echo '<tr style="background: #0066cc; color: white;">';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Page</th>';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Blocs trouvés</th>';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Vidéos extraites</th>';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de lien)</th>';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de titre)</th>';
-            echo '<th style="padding: 8px; border: 1px solid #ddd;">Rejetées (pas de vignette)</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Slug essaye</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Code HTTP</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Videos trouvees</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Erreur</th>';
             echo '</tr>';
-            
-            foreach ($result['debug_parse']['pages_data'] as $page_num => $page_data) {
-                if (is_array($page_data)) {
-                    echo '<tr>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . esc_html($page_num) . '</td>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . (isset($page_data['rows_found']) ? esc_html($page_data['rows_found']) : '0') . '</td>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #d4edda;">' . (isset($page_data['videos_extracted']) ? esc_html($page_data['videos_extracted']) : '0') . '</td>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #f8d7da;">' . (isset($page_data['rejected_no_link']) ? esc_html($page_data['rejected_no_link']) : '0') . '</td>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #fff3cd;">' . (isset($page_data['rejected_no_title']) ? esc_html($page_data['rejected_no_title']) : '0') . '</td>';
-                    echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #ffeaa7;">' . (isset($page_data['rejected_no_thumbnail']) ? esc_html($page_data['rejected_no_thumbnail']) : '0') . '</td>';
-                    echo '</tr>';
-                }
+
+            foreach ($result['debug_parse']['slug_attempts'] as $attempt) {
+                echo '<tr>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd;">' . esc_html($attempt['slug']) . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . (isset($attempt['status_code']) ? esc_html($attempt['status_code']) : '-') . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: #d4edda;">' . (isset($attempt['items_found']) ? esc_html($attempt['items_found']) : '-') . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; background: #f8d7da;">' . (isset($attempt['error']) ? esc_html($attempt['error']) : '') . '</td>';
+                echo '</tr>';
             }
             echo '</table>';
         }
-        
+
+        // Afficher le detail des tentatives de recuperation des vignettes (vide si la liste venait du cache principal)
+        $thumb_log = canalu_thumbnail_debug_log();
+        if (!empty($thumb_log)) {
+            echo '<h5 style="margin: 15px 0 10px; color: #0066cc;">Tentatives de vignettes (' . count($thumb_log) . '):</h5>';
+            echo '<table style="width: 100%; border-collapse: collapse; background: white;">';
+            echo '<tr style="background: #0066cc; color: white;">';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Lien video</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Source</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Trouvee</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Code HTTP</th>';
+            echo '<th style="padding: 8px; border: 1px solid #ddd;">Erreur / taille body</th>';
+            echo '</tr>';
+
+            foreach ($thumb_log as $entry) {
+                $found = !empty($entry['found']);
+                echo '<tr>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; word-break: break-all;">' . esc_html($entry['link']) . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . esc_html($entry['source'] ?? 'fetch') . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center; background: ' . ($found ? '#d4edda' : '#f8d7da') . ';">' . ($found ? 'oui' : 'non') . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd; text-align: center;">' . (isset($entry['status_code']) ? esc_html($entry['status_code']) : '-') . '</td>';
+                echo '<td style="padding: 8px; border: 1px solid #ddd;">' . esc_html($entry['error'] ?? (isset($entry['body_length']) ? $entry['body_length'] . ' octets' : '')) . '</td>';
+                echo '</tr>';
+            }
+            echo '</table>';
+        } else {
+            echo '<p style="color: #666;"><em>Liste des videos servie depuis le cache principal (' . esc_html($transient_key) . ') : aucune nouvelle tentative de vignette cette fois-ci.</em></p>';
+        }
+
         echo '</div>';
     }
     ?>
