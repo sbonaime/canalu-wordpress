@@ -5,7 +5,7 @@
 
 Un shortcode WordPress puissant pour afficher automatiquement les vidéos d'une chaîne [Canal-U](https://www.canal-u.tv/) dans une grille responsive sur votre site WordPress.
 
-![Screenshot](https://via.placeholder.com/800x400/2563eb/ffffff?text=Canal-U+WordPress+Grid)
+![Capture du shortcode Canal-U sur la page Webinaires et Conferences](readme-screenshot.png)
 
 ## 📋 Fonctionnalités
 
