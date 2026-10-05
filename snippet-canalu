@@ -25,6 +25,28 @@ function canalu_mark_antibot_blocked() {
     set_transient('canalu_antibot_block', true, 15 * MINUTE_IN_SECONDS);
 }
 
+// Le flux RSS fournit une URL HLS dans l'enclosure.
+// On peut en deduire directement l'image poster sans ouvrir la page video.
+function canalu_thumbnail_from_enclosure($enclosure_url) {
+    $enclosure_url = trim((string) $enclosure_url);
+    if ($enclosure_url === '') {
+        return '';
+    }
+
+    $pattern = '#^https://vod\.canal-u\.tv/hls/(\d{4})/(\d{2})/(\d+)/([^,/_]+(?:_[^,/_]+)*)#i';
+    if (!preg_match($pattern, $enclosure_url, $matches)) {
+        return '';
+    }
+
+    return sprintf(
+        'https://vod.canal-u.tv/videos/%s/%s/%s/%s.jpg',
+        $matches[1],
+        $matches[2],
+        $matches[3],
+        $matches[4]
+    );
+}
+
 // Le flux RSS n'a pas de vignette par video : on va la chercher sur la page de la video (balise og:image), avec un cache dedie
 // Seule une vignette trouvee avec succes est mise en cache longtemps ; un echec n'est garde que quelques minutes pour pouvoir reessayer
 // $budget limite le nombre de vraies requetes HTTP par chargement de page : canal-u.tv bloque/ralentit si on enchaine trop de requetes d'un coup,
@@ -104,7 +126,7 @@ function canalu_shortcode($atts) {
     }
 
     $chaine_slug = strtolower(trim($atts['chaine']));
-    $transient_key = 'canalu_rss_v3_' . md5($chaine_slug);
+    $transient_key = 'canalu_rss_v4_' . md5($chaine_slug);
 
     // L'attribut clear="true" permet de forcer un rafraichissement complet sans toucher au code (a retirer une fois le test fait)
     if ($atts['clear']) {
@@ -195,7 +217,8 @@ function canalu_shortcode($atts) {
         if ($limite <= 0) {
             $limite = 200;
         }
-        // Max 8 vraies requetes vignettes par chargement de page pour eviter de declencher un blocage anti-scraping chez canal-u.tv
+        // Les vignettes viennent d'abord de l'URL HLS du flux RSS.
+        // On garde un petit budget de repli sur les pages video uniquement si ce calcul echoue.
         $thumb_fetch_budget = 8;
 
         foreach ($xml->channel->item as $item) {
@@ -221,19 +244,30 @@ function canalu_shortcode($atts) {
                 $date = date_i18n('d/m/Y', $timestamp);
             }
 
+            $enclosure_url = '';
+
             // L'attribut "length" de l'enclosure correspond a la duree de la video en secondes
             $duree = '';
             if (isset($item->enclosure)) {
-                $seconds = (int) $item->enclosure->attributes()->length;
+                $enclosure_attributes = $item->enclosure->attributes();
+                $enclosure_url = isset($enclosure_attributes['url']) ? trim((string) $enclosure_attributes['url']) : '';
+                $seconds = (int) $enclosure_attributes->length;
                 if ($seconds > 0) {
                     $duree = sprintf('%d:%02d', floor($seconds / 60), $seconds % 60);
                 }
             }
 
+            $thumbnail = canalu_thumbnail_from_enclosure($enclosure_url);
+            if (!empty($thumbnail)) {
+                canalu_thumbnail_debug_log(array('link' => $link, 'source' => 'enclosure', 'found' => true));
+            } else {
+                $thumbnail = canalu_fetch_video_thumbnail($link, $fallback_thumbnail, $thumb_fetch_budget);
+            }
+
             $all_videos[] = array(
                 'title' => $title,
                 'link' => $link,
-                'thumbnail' => canalu_fetch_video_thumbnail($link, $fallback_thumbnail, $thumb_fetch_budget),
+                'thumbnail' => $thumbnail,
                 'auteurs' => '',
                 'description' => $description,
                 'type' => '',
